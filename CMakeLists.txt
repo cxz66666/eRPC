@@ -334,10 +334,14 @@ if(DPDK_NEEDED STREQUAL "true")
     message(STATUS "DPDK for Linux")
     find_library(DPDK_LIB dpdk)
     if(NOT DPDK_LIB)
-      message(FATAL_ERROR "DPDK library not found")
+      find_package(PkgConfig REQUIRED)
+      pkg_check_modules(PKG_DPDK_LIB REQUIRED libdpdk)
+      if(NOT PKG_DPDK_LIB_FOUND) 
+        message(FATAL_ERROR "DPDK library not found")
+      endif()
     endif()
 
-    set(LIBRARIES ${LIBRARIES} -Wl,--whole-archive dpdk -Wl,--no-whole-archive numa dl ibverbs mlx4 mlx5)
+    set(LIBRARIES ${LIBRARIES} -Wl,--whole-archive -Wl,--as-needed rte_node rte_graph rte_bpf rte_flow_classify rte_pipeline rte_table rte_port rte_fib rte_ipsec rte_vhost rte_stack rte_security rte_sched rte_reorder rte_rib rte_regexdev rte_rawdev rte_pdump rte_power rte_member rte_lpm rte_latencystats rte_kni rte_jobstats rte_ip_frag rte_gso rte_gro rte_eventdev rte_efd rte_distributor rte_cryptodev rte_compressdev rte_cfgfile rte_bitratestats rte_bbdev rte_acl rte_timer rte_hash rte_metrics rte_cmdline rte_pci rte_ethdev rte_meter rte_net rte_mbuf rte_mempool rte_rcu rte_ring rte_eal rte_telemetry rte_kvargs -Wl,--no-whole-archive numa dl ibverbs mlx5)
 
     # DPDK include directory. Locating rte_config.h does not work on some systems.
     # Example: it may be kept in /usr/include/x86_64-linux-gnu/, and symlinked
