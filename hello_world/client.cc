@@ -15,10 +15,12 @@ int main()
   rpc = new erpc::Rpc<erpc::CTransport>(&nexus, nullptr, 0, sm_handler);
 
   std::string server_uri = kServerHostname + ":" + std::to_string(kSUDPPort);
-  int session_num = rpc->create_session(server_uri, 0);
+  int session_num = rpc->create_session(server_uri, 13);
 
   while (!rpc->is_connected(session_num))
+  {
     rpc->run_event_loop_once();
+  }
 
   req = rpc->alloc_msg_buffer_or_die(kMsgSize);
   resp = rpc->alloc_msg_buffer_or_die(kMsgSize);

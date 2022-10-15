@@ -72,6 +72,8 @@
         "typeindex": "cpp",
         "typeinfo": "cpp",
         "source_location": "cpp",
-        "variant": "cpp"
-    }
+        "variant": "cpp",
+        "*.ipp": "cpp"
+    },
+    "C_Cpp.default.configurationProvider": "ms-vscode.makefile-tools"
 }
