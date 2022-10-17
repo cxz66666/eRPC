@@ -25,7 +25,8 @@ static constexpr size_t kAppMaxConcurrency = 128;
 
 DEFINE_uint64(batch_size, 0, "Request batch size");
 DEFINE_uint64(msg_size, 0, "Request and response size");
-DEFINE_uint64(num_threads, 0, "Number of foreground threads per machine");
+DEFINE_uint64(num_server_threads, 1, "Number of threads at the server machine");
+DEFINE_uint64(num_client_threads, 1, "Number of threads per client machine");
 DEFINE_uint64(concurrency, 0, "Concurrent batches per thread");
 
 volatile sig_atomic_t ctrl_c_pressed = 0;
@@ -116,7 +117,7 @@ struct app_stats_t
 static_assert(sizeof(app_stats_t) == 64, "");
 
 // Per-thread application context
-class AppContext : public BasicAppContext
+class ClientContext : public BasicAppContext
 {
 public:
   uint64_t tput_t0;       // Start time for throughput measurement
@@ -124,18 +125,24 @@ public:
 
   size_t stat_resp_rx[kAppMaxConcurrency] = {0}; // Resps received for batch i
   size_t stat_resp_rx_tot = 0;                   // Total responses received (all batches)
-  size_t stat_req_rx_tot = 0;                    // Total requests received (all batches)
 
   std::array<BatchContext, kAppMaxConcurrency> batch_arr; // Per-batch context
   erpc::Latency latency;                                  // Cold if latency measurement disabled
 
-  ~AppContext() {}
+  ~ClientContext() {}
+};
+
+class ServerContext : public BasicAppContext
+{
+public:
+  size_t stat_req_rx_tot = 0; // Total requests received (all batches)
+  ~ServerContext() {}
 };
 
 void app_cont_func(void *, void *); // Forward declaration
 
 // Send all requests for a batch
-void send_reqs(AppContext *c, size_t batch_i)
+void send_reqs(ClientContext *c, size_t batch_i)
 {
   assert(batch_i < FLAGS_concurrency);
   BatchContext &bc = c->batch_arr[batch_i];
@@ -173,60 +180,29 @@ void send_reqs(AppContext *c, size_t batch_i)
 
 void req_handler(erpc::ReqHandle *req_handle, void *_context)
 {
-  auto *c = static_cast<AppContext *>(_context);
+  auto *c = static_cast<ServerContext *>(_context);
   c->stat_req_rx_tot++;
 
   const erpc::MsgBuffer *req_msgbuf = req_handle->get_req_msgbuf();
   assert(req_msgbuf->get_data_size() == FLAGS_msg_size);
-
-  // RX ring request optimization knob
-  if (kAppOptDisableRxRingReq)
+  _unused(req_msgbuf);
+  erpc::Rpc<erpc::CTransport>::resize_msg_buffer(
+      &req_handle->pre_resp_msgbuf_, FLAGS_msg_size);
+  if (!kAppPayloadCheck)
   {
-    // Simulate copying the request off the RX ring
-    auto copy_msgbuf = c->rpc_->alloc_msg_buffer(FLAGS_msg_size);
-    assert(copy_msgbuf.buf_ != nullptr);
-    memcpy(copy_msgbuf.buf_, req_msgbuf->buf_, FLAGS_msg_size);
-    c->rpc_->free_msg_buffer(copy_msgbuf);
-  }
-
-  // Preallocated response optimization knob
-  if (kAppOptDisablePreallocResp)
-  {
-    erpc::MsgBuffer &resp_msgbuf = req_handle->dyn_resp_msgbuf_;
-    resp_msgbuf = c->rpc_->alloc_msg_buffer(FLAGS_msg_size);
-    assert(resp_msgbuf.buf_ != nullptr);
-
-    if (!kAppPayloadCheck)
-    {
-      resp_msgbuf.buf_[0] = req_msgbuf->buf_[0];
-    }
-    else
-    {
-      memcpy(resp_msgbuf.buf_, req_msgbuf->buf_, FLAGS_msg_size);
-    }
-    c->rpc_->enqueue_response(req_handle, &req_handle->dyn_resp_msgbuf_);
+    req_handle->pre_resp_msgbuf_.buf_[0] = req_msgbuf->buf_[0];
   }
   else
   {
-    erpc::Rpc<erpc::CTransport>::resize_msg_buffer(
-        &req_handle->pre_resp_msgbuf_, FLAGS_msg_size);
-
-    if (!kAppPayloadCheck)
-    {
-      req_handle->pre_resp_msgbuf_.buf_[0] = req_msgbuf->buf_[0];
-    }
-    else
-    {
-      memcpy(req_handle->pre_resp_msgbuf_.buf_, req_msgbuf->buf_,
-             FLAGS_msg_size);
-    }
-    c->rpc_->enqueue_response(req_handle, &req_handle->pre_resp_msgbuf_);
+    memcpy(req_handle->pre_resp_msgbuf_.buf_, req_msgbuf->buf_,
+           FLAGS_msg_size);
   }
+  c->rpc_->enqueue_response(req_handle, &req_handle->pre_resp_msgbuf_);
 }
 
 void app_cont_func(void *_context, void *_tag)
 {
-  auto *c = static_cast<AppContext *>(_context);
+  auto *c = static_cast<ClientContext *>(_context);
   auto tag = static_cast<tag_t>(_tag);
 
   BatchContext &bc = c->batch_arr[tag.s.batch_i];
@@ -283,11 +259,9 @@ void app_cont_func(void *_context, void *_tag)
   c->stat_resp_rx[tag.s.batch_i]++;
 }
 
-void connect_sessions(AppContext &c)
+void connect_sessions(ClientContext &c)
 {
-  // Create a session to each thread in the cluster except to:
-  // (a) all threads on this machine if DPDK is used (because no loopback), or
-  // (b) this thread if a non-DPDK transport is used.
+
   for (size_t p_i = 0; p_i < FLAGS_num_processes; p_i++)
   {
     if ((erpc::CTransport::kTransportType == erpc::TransportType::kDPDK) &&
@@ -304,17 +278,15 @@ void connect_sessions(AppContext &c)
              FLAGS_process_id, c.thread_id_, remote_uri.c_str());
     }
 
-    for (size_t t_i = 0; t_i < FLAGS_num_threads; t_i++)
+    for (size_t t_i = 0; t_i < FLAGS_num_server_threads; t_i++)
     {
-      if (FLAGS_process_id == p_i && c.thread_id_ == t_i)
-        continue;
       int session_num = c.rpc_->create_session(remote_uri, t_i);
       erpc::rt_assert(session_num >= 0, "Failed to create session");
       c.session_num_vec_.push_back(session_num);
     }
   }
 
-  while (c.num_sm_resps_ != c.session_num_vec_.size())
+  while (c.num_sm_resps_ != FLAGS_num_server_threads)
   {
     c.rpc_->run_event_loop(kAppEvLoopMs);
     if (unlikely(ctrl_c_pressed == 1))
@@ -322,7 +294,7 @@ void connect_sessions(AppContext &c)
   }
 }
 
-void print_stats(AppContext &c)
+void print_stats(ClientContext &c)
 {
   double seconds = erpc::to_sec(erpc::rdtsc() - c.tput_t0, c.rpc_->get_freq_ghz());
 
@@ -373,46 +345,58 @@ void print_stats(AppContext &c)
 
   printf(
       "Process %zu, thread %zu: %.3f Mrps, re_tx = %zu, still_in_wheel = %zu. "
-      "RX: %zuK resps, %zuK reqs. Resps/batch: min %zuK, max %zuK. "
+      "RX: %zuK resps. Resps/batch: min %zuK, max %zuK. "
       "Latency: %s. Rate = %s.\n",
       FLAGS_process_id, c.thread_id_, tput_mrps,
       c.app_stats[c.thread_id_].num_re_tx,
       c.rpc_->pkt_loss_stats_.still_in_wheel_during_retx_,
-      c.stat_resp_rx_tot / 1000, c.stat_req_rx_tot / 1000, min_resps / 1000,
+      c.stat_resp_rx_tot / 1000, min_resps / 1000,
       max_resps / 1000, kAppMeasureLatency ? lat_stat : "N/A",
       erpc::kCcRateComp ? rate_stat : "N/A");
 
-  if (c.thread_id_ == 0)
-  {
-    app_stats_t accum;
-    for (size_t i = 0; i < FLAGS_num_threads; i++)
-      accum += c.app_stats[i];
-    if (kAppMeasureLatency)
-    {
-      accum.lat_us_50 /= FLAGS_num_threads;
-      accum.lat_us_99 /= FLAGS_num_threads;
-      accum.lat_us_999 /= FLAGS_num_threads;
-      accum.lat_us_9999 /= FLAGS_num_threads;
-    }
-    c.tmp_stat_->write(accum.to_string());
-  }
-
   c.stat_resp_rx_tot = 0;
-  c.stat_req_rx_tot = 0;
   c.rpc_->pkt_loss_stats_.num_re_tx_ = 0;
   c.latency.reset();
+}
 
-  c.tput_t0 = erpc::rdtsc();
+void server_func(size_t thread_id, erpc::Nexus *nexus)
+{
+  ServerContext c;
+  c.thread_id_ = thread_id;
+
+  std::vector<size_t> port_vec = flags_get_numa_ports(FLAGS_numa_node);
+  erpc::rt_assert(port_vec.size() > 0);
+  uint8_t phy_port = port_vec.at(thread_id % port_vec.size());
+  erpc::Rpc<erpc::CTransport> rpc(nexus, static_cast<void *>(&c),
+                                  static_cast<uint8_t>(thread_id),
+                                  basic_sm_handler, phy_port);
+  rpc.retry_connect_on_invalid_rpc_id_ = true;
+  c.rpc_ = &rpc;
+  while (true)
+  {
+    c.stat_req_rx_tot = 0;
+    erpc::ChronoTimer start;
+    rpc.run_event_loop(kAppEvLoopMs);
+    const double seconds = start.get_sec();
+    printf("thread %zu: %.2f M/s. rx batch %.2f, tx batch %.2f\n", thread_id,
+           c.stat_req_rx_tot / (seconds * Mi(1)), c.rpc_->get_avg_rx_batch(),
+           c.rpc_->get_avg_tx_batch());
+
+    c.rpc_->reset_dpath_stats();
+    c.stat_req_rx_tot = 0;
+    if (ctrl_c_pressed == 1)
+    {
+      break;
+    }
+  }
 }
 
 // The function executed by each thread in the cluster
-void client_func(size_t thread_id, app_stats_t *app_stats, erpc::Nexus *nexus)
+void client_func(size_t thread_id, erpc::Nexus *nexus)
 {
-  AppContext c;
+  ClientContext c;
   c.thread_id_ = thread_id;
-  c.app_stats = app_stats;
-  if (thread_id == 0)
-    c.tmp_stat_ = new TmpStat(app_stats_t::get_template_str());
+  c.app_stats = new app_stats_t();
 
   std::vector<size_t> port_vec = flags_get_numa_ports(FLAGS_numa_node);
   erpc::rt_assert(port_vec.size() > 0);
@@ -442,12 +426,12 @@ void client_func(size_t thread_id, app_stats_t *app_stats, erpc::Nexus *nexus)
          FLAGS_process_id, thread_id);
 
   // Start work
-  c.tput_t0 = erpc::rdtsc();
   for (size_t i = 0; i < FLAGS_concurrency; i++)
     send_reqs(&c, i);
 
   for (size_t i = 0; i < FLAGS_test_ms; i += 1000)
   {
+    c.tput_t0 = erpc::rdtsc();
     rpc.run_event_loop(kAppEvLoopMs); // 1 second
     if (ctrl_c_pressed == 1)
       break;
@@ -465,7 +449,7 @@ int main(int argc, char **argv)
   erpc::rt_assert(FLAGS_numa_node <= 1, "Invalid NUMA node");
 
   // We create a bit fewer sessions
-  const size_t num_sessions = 2 * FLAGS_num_processes * FLAGS_num_threads;
+  const size_t num_sessions = FLAGS_num_client_threads * FLAGS_num_server_threads;
   erpc::rt_assert(num_sessions * erpc::kSessionCredits <=
                       erpc::Transport::kNumRxRingEntries,
                   "Too few ring buffers");
@@ -475,16 +459,16 @@ int main(int argc, char **argv)
   nexus.register_req_func(kAppReqType, req_handler);
   nexus.register_req_func(kPingReqHandlerType, ping_req_handler);
 
-  std::vector<std::thread> threads(FLAGS_num_threads);
-  auto *app_stats = new app_stats_t[FLAGS_num_threads];
+  size_t num_threads = FLAGS_process_id == 0 ? FLAGS_num_server_threads : FLAGS_num_client_threads;
 
-  for (size_t i = 0; i < FLAGS_num_threads; i++)
+  std::vector<std::thread> threads(num_threads);
+
+  for (size_t i = 0; i < num_threads; i++)
   {
-    threads[i] = std::thread(client_func, i, app_stats, &nexus);
+    threads[i] = std::thread(FLAGS_process_id == 0 ? server_func : client_func, i, &nexus);
     erpc::bind_to_core(threads[i], FLAGS_numa_node, i);
   }
 
   for (auto &thread : threads)
     thread.join();
-  delete[] app_stats;
 }

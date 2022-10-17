@@ -8,11 +8,11 @@
 #include "util/numautils.h"
 #include "util/timer.h"
 
-static constexpr size_t kAppEvLoopMs = 1000;    // Duration of event loop
-static constexpr bool kAppVerbose = false;      // Print debug info on datapath
-static constexpr double kAppLatFac = 10.0;      // Precision factor for latency
-static constexpr size_t kAppReqType = 1;        // eRPC request type
-static constexpr size_t kAppMaxWindowSize = 32; // Max pending reqs per client
+static constexpr size_t kAppEvLoopMs = 1000;     // Duration of event loop
+static constexpr bool kAppVerbose = false;       // Print debug info on datapath
+static constexpr double kAppLatFac = 10.0;       // Precision factor for latency
+static constexpr size_t kAppReqType = 1;         // eRPC request type
+static constexpr size_t kAppMaxWindowSize = 128; // Max pending reqs per client
 
 DEFINE_uint64(num_server_threads, 1, "Number of threads at the server machine");
 DEFINE_uint64(num_client_threads, 1, "Number of threads per client machine");
