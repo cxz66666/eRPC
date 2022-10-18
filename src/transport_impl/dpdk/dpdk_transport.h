@@ -217,10 +217,10 @@ namespace erpc
     static constexpr size_t kMTU = 1500;
 
     static constexpr size_t kNumTxRingDesc = 1024;
-    static constexpr size_t kPostlist = 64;
+    static constexpr size_t kPostlist = 128;
 
     // For now, this is just for erpc::Rpc to size its array of control Msgbufs
-    static constexpr size_t kUnsigBatch = 64;
+    static constexpr size_t kUnsigBatch = 128;
 
     /// Maximum number of packets received in rx_burst
     static constexpr size_t kRxBatchSize = 128;

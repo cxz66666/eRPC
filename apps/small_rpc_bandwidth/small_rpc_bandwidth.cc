@@ -129,7 +129,10 @@ public:
   std::array<BatchContext, kAppMaxConcurrency> batch_arr; // Per-batch context
   erpc::Latency latency;                                  // Cold if latency measurement disabled
 
-  ~ClientContext() {}
+  ~ClientContext()
+  {
+    delete app_stats;
+  }
 };
 
 class ServerContext : public BasicAppContext
@@ -252,7 +255,10 @@ void app_cont_func(void *_context, void *_tag)
   {
     // If we have a full batch, reset batch progress and send more requests
     bc.num_resps_rcvd = 0;
-    send_reqs(c, tag.s.batch_i);
+    if (!ctrl_c_pressed)
+    {
+      send_reqs(c, tag.s.batch_i);
+    }
   }
 
   c->stat_resp_rx_tot++;
@@ -283,11 +289,26 @@ void connect_sessions(ClientContext &c)
     c.session_num_vec_.push_back(session_num);
   }
 
-  while (c.num_sm_resps_ != FLAGS_num_server_threads)
+  while (c.num_sm_resps_ != 1)
   {
     c.rpc_->run_event_loop(kAppEvLoopMs);
     if (unlikely(ctrl_c_pressed == 1))
       return;
+  }
+}
+
+void disconnect_session(ClientContext &c)
+{
+  for (auto m : c.session_num_vec_)
+  {
+    while (c.rpc_->destroy_session(m) != 0)
+    {
+      c.rpc_->run_event_loop(kAppEvLoopMs);
+    }
+  }
+  while (c.num_sm_resps_ != 2)
+  {
+    c.rpc_->run_event_loop(kAppEvLoopMs);
   }
 }
 
@@ -317,14 +338,15 @@ void print_stats(ClientContext &c)
   }
 
   double tput_mrps = c.stat_resp_rx_tot / (seconds * 1000000);
-  c.app_stats[c.thread_id_].mrps = tput_mrps;
-  c.app_stats[c.thread_id_].num_re_tx = c.rpc_->pkt_loss_stats_.num_re_tx_;
+  double tput_gbps = c.stat_resp_rx_tot * FLAGS_msg_size * 8 / (seconds * 1000000000);
+  c.app_stats->mrps = tput_mrps;
+  c.app_stats->num_re_tx = c.rpc_->pkt_loss_stats_.num_re_tx_;
   if (kAppMeasureLatency)
   {
-    c.app_stats[c.thread_id_].lat_us_50 = c.latency.perc(0.50) / kAppLatFac;
-    c.app_stats[c.thread_id_].lat_us_99 = c.latency.perc(0.99) / kAppLatFac;
-    c.app_stats[c.thread_id_].lat_us_999 = c.latency.perc(0.999) / kAppLatFac;
-    c.app_stats[c.thread_id_].lat_us_9999 = c.latency.perc(0.9999) / kAppLatFac;
+    c.app_stats->lat_us_50 = c.latency.perc(0.50) / kAppLatFac;
+    c.app_stats->lat_us_99 = c.latency.perc(0.99) / kAppLatFac;
+    c.app_stats->lat_us_999 = c.latency.perc(0.999) / kAppLatFac;
+    c.app_stats->lat_us_9999 = c.latency.perc(0.9999) / kAppLatFac;
   }
 
   size_t num_sessions = c.session_num_vec_.size();
@@ -341,11 +363,11 @@ void print_stats(ClientContext &c)
           erpc::kCcRateComp ? session_tput.at(num_sessions * 0.95) : -1);
 
   printf(
-      "Process %zu, thread %zu: %.3f Mrps, re_tx = %zu, still_in_wheel = %zu. "
+      "Process %zu, thread %zu: %.3f Mrps, %.3f Gbps, re_tx = %zu, still_in_wheel = %zu. "
       "RX: %zuK resps. Resps/batch: min %zuK, max %zuK. "
       "Latency: %s. Rate = %s.\n",
-      FLAGS_process_id, c.thread_id_, tput_mrps,
-      c.app_stats[c.thread_id_].num_re_tx,
+      FLAGS_process_id, c.thread_id_, tput_mrps, tput_gbps,
+      c.app_stats->num_re_tx,
       c.rpc_->pkt_loss_stats_.still_in_wheel_during_retx_,
       c.stat_resp_rx_tot / 1000, min_resps / 1000,
       max_resps / 1000, kAppMeasureLatency ? lat_stat : "N/A",
@@ -381,7 +403,7 @@ void server_func(size_t thread_id, erpc::Nexus *nexus)
 
     c.rpc_->reset_dpath_stats();
     c.stat_req_rx_tot = 0;
-    if (ctrl_c_pressed == 1)
+    if (ctrl_c_pressed == 1 || (c.rpc_->sec_since_creation() * 1000 > FLAGS_test_ms && c.rpc_->num_active_sessions() == 0))
     {
       break;
     }
@@ -434,11 +456,15 @@ void client_func(size_t thread_id, erpc::Nexus *nexus)
       break;
     print_stats(c);
   }
+  ctrl_c_pressed = 1;
+
+  disconnect_session(c);
 }
 
 int main(int argc, char **argv)
 {
   signal(SIGINT, ctrl_c_handler);
+  signal(SIGTERM, ctrl_c_handler);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   erpc::rt_assert(FLAGS_batch_size <= kAppMaxBatchSize, "Invalid batch size");
@@ -446,7 +472,7 @@ int main(int argc, char **argv)
   erpc::rt_assert(FLAGS_numa_node <= 1, "Invalid NUMA node");
 
   // We create a bit fewer sessions
-  const size_t num_sessions = FLAGS_num_client_threads * FLAGS_num_server_threads;
+  const size_t num_sessions = FLAGS_num_client_threads;
   erpc::rt_assert(num_sessions * erpc::kSessionCredits <=
                       erpc::Transport::kNumRxRingEntries,
                   "Too few ring buffers");
@@ -465,7 +491,8 @@ int main(int argc, char **argv)
     threads[i] = std::thread(FLAGS_process_id == 0 ? server_func : client_func, i, &nexus);
     erpc::bind_to_core(threads[i], FLAGS_numa_node, i);
   }
-
-  for (auto &thread : threads)
-    thread.join();
+  for (size_t i = 0; i < num_threads; i++)
+  {
+    threads[i].join();
+  }
 }
