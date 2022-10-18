@@ -30,7 +30,7 @@ namespace erpc
   class DpdkTransport : public Transport
   {
   public:
-    static constexpr size_t kMaxQueuesPerPort = kIsWindows ? 1 : 4;
+    static constexpr size_t kMaxQueuesPerPort = kIsWindows ? 1 : 16;
     static constexpr size_t kInvalidQpId = SIZE_MAX;
 
     /// Contents of the memzone created by the eRPC DPDK daemon process
@@ -214,7 +214,7 @@ namespace erpc
 
     // Transport-specific constants
     static constexpr TransportType kTransportType = TransportType::kDPDK;
-    static constexpr size_t kMTU = 1024;
+    static constexpr size_t kMTU = 1500;
 
     static constexpr size_t kNumTxRingDesc = 1024;
     static constexpr size_t kPostlist = 64;

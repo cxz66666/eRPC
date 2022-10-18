@@ -278,12 +278,9 @@ void connect_sessions(ClientContext &c)
              FLAGS_process_id, c.thread_id_, remote_uri.c_str());
     }
 
-    for (size_t t_i = 0; t_i < FLAGS_num_server_threads; t_i++)
-    {
-      int session_num = c.rpc_->create_session(remote_uri, t_i);
-      erpc::rt_assert(session_num >= 0, "Failed to create session");
-      c.session_num_vec_.push_back(session_num);
-    }
+    int session_num = c.rpc_->create_session(remote_uri, c.thread_id_);
+    erpc::rt_assert(session_num >= 0, "Failed to create session");
+    c.session_num_vec_.push_back(session_num);
   }
 
   while (c.num_sm_resps_ != FLAGS_num_server_threads)
