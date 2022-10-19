@@ -20,7 +20,7 @@ static constexpr bool kAppOptDisableRxRingReq = false;
 
 static constexpr size_t kAppReqType = 1;   // eRPC request type
 static constexpr uint8_t kAppDataByte = 3; // Data transferred in req & resp
-static constexpr size_t kAppMaxBatchSize = 32;
+static constexpr size_t kAppMaxBatchSize = 256;
 static constexpr size_t kAppMaxConcurrency = 128;
 
 DEFINE_uint64(batch_size, 0, "Request batch size");
@@ -30,7 +30,7 @@ DEFINE_uint64(num_client_threads, 1, "Number of threads per client machine");
 DEFINE_uint64(concurrency, 0, "Concurrent batches per thread");
 
 volatile sig_atomic_t ctrl_c_pressed = 0;
-void ctrl_c_handler(int) { ctrl_c_pressed = 1; }
+void ctrl_c_handler(int) { ctrl_c_pressed++; }
 
 union tag_t
 {
@@ -304,6 +304,10 @@ void disconnect_session(ClientContext &c)
     while (c.rpc_->destroy_session(m) != 0)
     {
       c.rpc_->run_event_loop(kAppEvLoopMs);
+      if (ctrl_c_pressed > 5)
+      {
+        exit(-1);
+      }
     }
   }
   while (c.num_sm_resps_ != 2)
@@ -452,7 +456,7 @@ void client_func(size_t thread_id, erpc::Nexus *nexus)
   {
     c.tput_t0 = erpc::rdtsc();
     rpc.run_event_loop(kAppEvLoopMs); // 1 second
-    if (ctrl_c_pressed == 1)
+    if (ctrl_c_pressed > 0)
       break;
     print_stats(c);
   }
@@ -486,7 +490,13 @@ int main(int argc, char **argv)
 
   std::vector<std::thread> threads(num_threads);
 
-  for (size_t i = 0; i < num_threads; i++)
+  threads[0] = std::thread(FLAGS_process_id == 0 ? server_func : client_func, 0, &nexus);
+  // wait for dpdk init
+  usleep(2e6);
+
+  erpc::bind_to_core(threads[0], FLAGS_numa_node, 0);
+
+  for (size_t i = 1; i < num_threads; i++)
   {
     threads[i] = std::thread(FLAGS_process_id == 0 ? server_func : client_func, i, &nexus);
     erpc::bind_to_core(threads[i], FLAGS_numa_node, i);
