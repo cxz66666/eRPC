@@ -372,6 +372,7 @@ void server_func(size_t thread_id, erpc::Nexus *nexus)
   {
     c.stat_req_rx_tot = 0;
     erpc::ChronoTimer start;
+    start.reset();
     rpc.run_event_loop(kAppEvLoopMs);
     const double seconds = start.get_sec();
     printf("thread %zu: %.2f M/s. rx batch %.2f, tx batch %.2f\n", thread_id,
