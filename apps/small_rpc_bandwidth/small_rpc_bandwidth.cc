@@ -1,6 +1,7 @@
 #include <gflags/gflags.h>
 #include <signal.h>
 #include <cstring>
+#include <unordered_set>
 #include "../apps_common.h"
 #include "rpc.h"
 #include "util/autorun_helpers.h"
@@ -20,10 +21,8 @@ static constexpr bool kAppOptDisableRxRingReq = false;
 
 static constexpr size_t kAppReqType = 1;   // eRPC request type
 static constexpr uint8_t kAppDataByte = 3; // Data transferred in req & resp
-static constexpr size_t kAppMaxBatchSize = 256;
-static constexpr size_t kAppMaxConcurrency = 128;
+static constexpr size_t kAppMaxConcurrency = 256;
 
-DEFINE_uint64(batch_size, 0, "Request batch size");
 DEFINE_uint64(msg_size, 0, "Request and response size");
 DEFINE_uint64(num_server_threads, 1, "Number of threads at the server machine");
 DEFINE_uint64(num_client_threads, 1, "Number of threads per client machine");
@@ -56,10 +55,9 @@ static_assert(sizeof(tag_t) == sizeof(void *), "");
 class BatchContext
 {
 public:
-  size_t num_resps_rcvd = 0;        // Number of responses received
-  size_t req_tsc[kAppMaxBatchSize]; // Timestamp when request was issued
-  erpc::MsgBuffer req_msgbuf[kAppMaxBatchSize];
-  erpc::MsgBuffer resp_msgbuf[kAppMaxBatchSize];
+  size_t req_tsc; // Timestamp when request was issued
+  erpc::MsgBuffer req_msgbuf;
+  erpc::MsgBuffer resp_msgbuf;
 };
 
 struct app_stats_t
@@ -123,11 +121,11 @@ public:
   uint64_t tput_t0;       // Start time for throughput measurement
   app_stats_t *app_stats; // Common stats array for all threads
 
-  size_t stat_resp_rx[kAppMaxConcurrency] = {0}; // Resps received for batch i
-  size_t stat_resp_rx_tot = 0;                   // Total responses received (all batches)
+  size_t stat_resp_rx_tot = 0; // Total responses received (all batches)
 
   std::array<BatchContext, kAppMaxConcurrency> batch_arr; // Per-batch context
-  erpc::Latency latency;                                  // Cold if latency measurement disabled
+  std::unordered_set<int> free_concurrency;
+  erpc::Latency latency; // Cold if latency measurement disabled
 
   ~ClientContext()
   {
@@ -150,35 +148,32 @@ void send_reqs(ClientContext *c, size_t batch_i)
   assert(batch_i < FLAGS_concurrency);
   BatchContext &bc = c->batch_arr[batch_i];
 
-  for (size_t i = 0; i < FLAGS_batch_size; i++)
+  if (kAppVerbose)
   {
-    if (kAppVerbose)
-    {
-      printf("Process %zu, Rpc %u: Sending request for batch %zu.\n",
-             FLAGS_process_id, c->rpc_->get_rpc_id(), batch_i);
-    }
-
-    if (!kAppPayloadCheck)
-    {
-      bc.req_msgbuf[i].buf_[0] = kAppDataByte; // Touch req MsgBuffer
-    }
-    else
-    {
-      // Fill the request MsgBuffer with a checkable sequence
-      uint8_t *buf = bc.req_msgbuf[i].buf_;
-      buf[0] = c->fastrand_.next_u32();
-      for (size_t j = 1; j < FLAGS_msg_size; j++)
-        buf[j] = buf[0] + j;
-    }
-
-    if (kAppMeasureLatency)
-      bc.req_tsc[i] = erpc::rdtsc();
-
-    tag_t tag(batch_i, i);
-    c->rpc_->enqueue_request(c->fast_get_rand_session_num(), kAppReqType,
-                             &bc.req_msgbuf[i], &bc.resp_msgbuf[i],
-                             app_cont_func, reinterpret_cast<void *>(tag._tag));
+    printf("Process %zu, Rpc %u: Sending request for batch %zu.\n",
+           FLAGS_process_id, c->rpc_->get_rpc_id(), batch_i);
   }
+
+  if (!kAppPayloadCheck)
+  {
+    bc.req_msgbuf.buf_[0] = kAppDataByte; // Touch req MsgBuffer
+  }
+  else
+  {
+    // Fill the request MsgBuffer with a checkable sequence
+    uint8_t *buf = bc.req_msgbuf.buf_;
+    buf[0] = c->fastrand_.next_u32();
+    for (size_t j = 1; j < FLAGS_msg_size; j++)
+      buf[j] = buf[0] + j;
+  }
+
+  if (kAppMeasureLatency)
+    bc.req_tsc = erpc::rdtsc();
+
+  tag_t tag(batch_i, 0);
+  c->rpc_->enqueue_request(c->session_num_vec_[0], kAppReqType,
+                           &bc.req_msgbuf, &bc.resp_msgbuf,
+                           app_cont_func, reinterpret_cast<void *>(tag._tag));
 }
 
 void req_handler(erpc::ReqHandle *req_handle, void *_context)
@@ -209,17 +204,17 @@ void app_cont_func(void *_context, void *_tag)
   auto tag = static_cast<tag_t>(_tag);
 
   BatchContext &bc = c->batch_arr[tag.s.batch_i];
-  const erpc::MsgBuffer &resp_msgbuf = bc.resp_msgbuf[tag.s.msgbuf_i];
+  const erpc::MsgBuffer &resp_msgbuf = bc.resp_msgbuf;
   assert(resp_msgbuf.get_data_size() == FLAGS_msg_size);
 
   if (!kAppPayloadCheck)
   {
     // Do a cheap check, but touch the response MsgBuffer
-    if (unlikely(resp_msgbuf.buf_[0] != kAppDataByte))
-    {
-      fprintf(stderr, "Invalid response.\n");
-      exit(-1);
-    }
+    // if (unlikely(resp_msgbuf.buf_[0] != kAppDataByte))
+    // {
+    //   fprintf(stderr, "Invalid response.\n");
+    //   exit(-1);
+    // }
   }
   else
   {
@@ -241,28 +236,16 @@ void app_cont_func(void *_context, void *_tag)
            tag.s.msgbuf_i);
   }
 
-  bc.num_resps_rcvd++;
-
   if (kAppMeasureLatency)
   {
-    size_t req_tsc = bc.req_tsc[tag.s.msgbuf_i];
+    size_t req_tsc = bc.req_tsc;
     double req_lat_us =
         erpc::to_usec(erpc::rdtsc() - req_tsc, c->rpc_->get_freq_ghz());
     c->latency.update(static_cast<size_t>(req_lat_us * kAppLatFac));
   }
 
-  if (bc.num_resps_rcvd == FLAGS_batch_size)
-  {
-    // If we have a full batch, reset batch progress and send more requests
-    bc.num_resps_rcvd = 0;
-    if (!ctrl_c_pressed)
-    {
-      send_reqs(c, tag.s.batch_i);
-    }
-  }
-
   c->stat_resp_rx_tot++;
-  c->stat_resp_rx[tag.s.batch_i]++;
+  c->free_concurrency.insert(static_cast<int>(tag.s.batch_i));
 }
 
 void connect_sessions(ClientContext &c)
@@ -320,15 +303,6 @@ void print_stats(ClientContext &c)
 {
   double seconds = erpc::to_sec(erpc::rdtsc() - c.tput_t0, c.rpc_->get_freq_ghz());
 
-  // Min/max responses for a concurrent batch, to check for stagnated batches
-  size_t max_resps = 0, min_resps = SIZE_MAX;
-  for (size_t i = 0; i < FLAGS_concurrency; i++)
-  {
-    min_resps = std::min(min_resps, c.stat_resp_rx[i]);
-    max_resps = std::max(max_resps, c.stat_resp_rx[i]);
-    c.stat_resp_rx[i] = 0;
-  }
-
   // Session throughput percentiles, used if rate computation is enabled
   std::vector<double> session_tput;
   if (erpc::kCcRateComp)
@@ -368,13 +342,12 @@ void print_stats(ClientContext &c)
 
   printf(
       "Process %zu, thread %zu: %.3f Mrps, %.3f Gbps, re_tx = %zu, still_in_wheel = %zu. "
-      "RX: %zuK resps. Resps/batch: min %zuK, max %zuK. "
+      "RX: %zuK resps."
       "Latency: %s. Rate = %s.\n",
       FLAGS_process_id, c.thread_id_, tput_mrps, tput_gbps,
       c.app_stats->num_re_tx,
       c.rpc_->pkt_loss_stats_.still_in_wheel_during_retx_,
-      c.stat_resp_rx_tot / 1000, min_resps / 1000,
-      max_resps / 1000, kAppMeasureLatency ? lat_stat : "N/A",
+      c.stat_resp_rx_tot / 1000, kAppMeasureLatency ? lat_stat : "N/A",
       erpc::kCcRateComp ? rate_stat : "N/A");
 
   c.stat_resp_rx_tot = 0;
@@ -436,11 +409,9 @@ void client_func(size_t thread_id, erpc::Nexus *nexus)
   for (size_t i = 0; i < FLAGS_concurrency; i++)
   {
     BatchContext &bc = c.batch_arr[i];
-    for (size_t j = 0; j < FLAGS_batch_size; j++)
-    {
-      bc.req_msgbuf[j] = rpc.alloc_msg_buffer_or_die(FLAGS_msg_size);
-      bc.resp_msgbuf[j] = rpc.alloc_msg_buffer_or_die(FLAGS_msg_size);
-    }
+
+    bc.req_msgbuf = rpc.alloc_msg_buffer_or_die(FLAGS_msg_size);
+    bc.resp_msgbuf = rpc.alloc_msg_buffer_or_die(FLAGS_msg_size);
   }
 
   connect_sessions(c);
@@ -455,7 +426,22 @@ void client_func(size_t thread_id, erpc::Nexus *nexus)
   for (size_t i = 0; i < FLAGS_test_ms; i += 1000)
   {
     c.tput_t0 = erpc::rdtsc();
-    rpc.run_event_loop(kAppEvLoopMs); // 1 second
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    size_t end = start.tv_sec * 1e9 + start.tv_nsec + 1e9;
+    while (true)
+    {
+      c.rpc_->run_event_loop_once(); // Run at least once even if timeout_ms is 0
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (unlikely(now.tv_sec * 1e9 + now.tv_nsec > end))
+        break;
+      for (auto m : c.free_concurrency)
+      {
+        send_reqs(&c, static_cast<size_t>(m));
+      }
+      c.free_concurrency.clear();
+    }
+
     if (ctrl_c_pressed > 0)
       break;
     print_stats(c);
@@ -471,12 +457,11 @@ int main(int argc, char **argv)
   signal(SIGTERM, ctrl_c_handler);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  erpc::rt_assert(FLAGS_batch_size <= kAppMaxBatchSize, "Invalid batch size");
   erpc::rt_assert(FLAGS_concurrency <= kAppMaxConcurrency, "Invalid cncrrncy.");
   erpc::rt_assert(FLAGS_numa_node <= 1, "Invalid NUMA node");
 
   // We create a bit fewer sessions
-  const size_t num_sessions = FLAGS_num_client_threads;
+  const size_t num_sessions = 1;
   erpc::rt_assert(num_sessions * erpc::kSessionCredits <=
                       erpc::Transport::kNumRxRingEntries,
                   "Too few ring buffers");
