@@ -96,8 +96,6 @@ void app_cont_func(void *_context, void *_tag)
   c->lat_vec.push_back(usec);
 
   // Check the response
-  erpc::rt_assert(resp_msgbuf.get_data_size() == FLAGS_resp_size,
-                  "Invalid response size");
 
   if (kAppClientCheckResp)
   {
